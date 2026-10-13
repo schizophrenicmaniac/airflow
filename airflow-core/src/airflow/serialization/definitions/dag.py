@@ -779,6 +779,10 @@ class SerializedDAG:
         ]
 
         for alert_id, alert_name, alert_reference, alert_interval, alert_callback_def in stored_alerts:
+            # A reference that rolls back the session also discards the uncommitted DagRun. Any
+            # Deadline added after that points at a row that will never exist and fails the flush.
+            if orm_dagrun not in session:
+                break
             # Deadline creation is best-effort. Catch per alert so one bad alert cannot starve the rest or abort the DagRun.
             try:
                 deserialized_deadline_alert = decode_deadline_alert(
@@ -801,6 +805,8 @@ class SerializedDAG:
                     )
 
                     if deadline_time is not None:
+                        if orm_dagrun not in session:
+                            break
                         session.add(
                             Deadline(
                                 deadline_time=deadline_time,
@@ -835,6 +841,13 @@ class SerializedDAG:
                     deadline_alert_id=alert_id,
                 )
                 stats.incr("deadline_alerts.deadline_creation_failed", tags=metrics_tags)
+
+        if orm_dagrun not in session:
+            log.error(
+                "stopped creating deadlines because a deadline alert rolled back the session, discarding the Dag run",
+                dag_id=self.dag_id,
+                run_id=run_id,
+            )
 
     @provide_session
     def set_task_instance_state(

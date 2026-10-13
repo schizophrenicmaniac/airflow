@@ -2054,6 +2054,59 @@ class TestDagRun:
             tags={"dag_id": scheduler_dag.dag_id},
         )
 
+    @pytest.mark.parametrize("raise_after_rollback", [True, False], ids=["raises", "returns"])
+    @mock.patch.object(Deadline, "prune_deadlines")
+    def test_dagrun_deadline_alert_that_rolls_back_session_stops_deadline_creation(
+        self, _, raise_after_rollback, session, deadline_test_dag, caplog
+    ):
+        """A reference that rolls back the session discards the uncommitted DagRun with it. No Deadline
+        may be added for that DagRun afterwards, or the scheduler's next flush fails on its foreign key."""
+        future_date = datetime.datetime(2037, 1, 1, tzinfo=datetime.UTC)
+        scheduler_dag = deadline_test_dag(
+            deadline=[
+                DeadlineAlert(
+                    reference=DeadlineReference.FIXED_DATETIME(future_date),
+                    interval=datetime.timedelta(hours=1),
+                    callback=AsyncCallback(empty_callback_for_deadline),
+                ),
+                DeadlineAlert(
+                    reference=DeadlineReference.FIXED_DATETIME(future_date),
+                    interval=datetime.timedelta(hours=2),
+                    callback=AsyncCallback(empty_callback_for_deadline),
+                ),
+            ],
+        )
+        # Keep the alert rows out of the transaction the rollback below discards.
+        session.commit()
+
+        def roll_back_on_first_call(_reference, *, interval, **kwargs):
+            if mock_evaluate_with.call_count == 1:
+                session.rollback()
+                if raise_after_rollback:
+                    raise RuntimeError("relation my_sla_table does not exist")
+            return future_date + interval
+
+        with (
+            mock.patch.object(
+                SerializedReferenceModels.FixedDatetimeDeadline,
+                "evaluate_with",
+                autospec=True,
+                side_effect=roll_back_on_first_call,
+            ) as mock_evaluate_with,
+            caplog.at_level("ERROR"),
+        ):
+            dag_run = self.create_dag_run(dag=scheduler_dag, session=session)
+
+        assert dag_run not in session
+        assert mock_evaluate_with.call_count == 1
+        session.flush()
+        assert session.execute(select(Deadline)).scalars().one_or_none() is None
+        assert {
+            "event": "stopped creating deadlines because a deadline alert rolled back the session, discarding the Dag run",
+            "dag_id": "test_dag",
+            "log_level": "error",
+        } in caplog
+
     @pytest.mark.parametrize(
         ("interval", "expect_deadline", "variable_value"),
         [
